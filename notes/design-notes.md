@@ -1,39 +1,26 @@
-# Design notes — Assignment 1 (Library Management System API)
+# Design notes — Assignment 2 (persistence and layered design)
 
-Working notes for my own reference. Not a graded deliverable (the README is).
+Working notes, not a graded deliverable (the README is).
 
-## Resources and fields (from the assignment docx)
+## Layer boundaries
 
-**Book**: id (server), title (1-200, trimmed), author (1-120, trimmed), isbn (unique), published_year (1450..current year), member_id (must reference an existing Member).
+- `routers/` — HTTP only. Call a service through `Depends(...)`, catch application exceptions, map them in `routers/http_errors.py`.
+- `services/<resource>/base.py` — abstract contract. `database.py` and `in_memory.py` implement it. Services never import FastAPI.
+- `repositories/` — SQLAlchemy queries only. They `flush()` so IDs and constraint errors surface inside the service's transaction; they never commit.
+- `models/` — ORM tables. `schemas/` — API contract. Responses use `from_attributes=True` to serialize ORM objects.
 
-**Member**: id (server), name (1-120, trimmed), email (EmailStr, unique), membership_id (unique), phone (required, "follow and document one validation rule").
+## Transactions
 
-Chosen phone rule: must match `NNN-NNN-NNNN` (e.g. `214-555-0199`), enforced with a `field_validator` + documented in the field description and README. This is the "one validation rule" the assignment asks for and to document.
+Reads: `with session_factory() as session`. Writes: `with session_factory.begin() as session` in the service, so the whole use case commits or rolls back together. `create_book` checks the Member, checks the ISBN, and inserts in one Session/transaction.
 
-## Relationship
+## Duplicates and races
 
-One Member -> many Books, via `Book.member_id`. Mirrors the Project->Task pattern in `project-task-api`:
-- `find_member()` in `app/routers/members.py` raises 404 if missing; `books.py` imports and calls it before creating/replacing a Book.
-- `GET /members/{id}/books` mirrors `GET /projects/{id}/tasks`.
-- Deleting a Member with Books returns 409 (mirrors blocked Project delete), not a cascade delete — assignment explicitly requires this ("must first be deleted or reassigned").
+Services pre-check email / membership_id / ISBN for clear errors (excluding the record's own id on replace). Two requests can still race past the pre-check, so the unique constraints are named and `services/integrity.py` reads the violated constraint name from the Psycopg diagnostics. The service re-raises the same application exception the pre-check would have. The `books.member_id` foreign key does the same for a Member deleted mid-create (404) or a Book added mid-delete (409).
 
-## Duplicate checks (409 Conflict)
+## Backend selection
 
-The reference project didn't need uniqueness checks (Projects/Tasks have no unique fields). This assignment requires ISBN, email, and membership_id to be unique, so I added `_check_unique_isbn` in books.py and `_check_unique` in members.py, both used on create and on replace (excluding the record's own id during replace so an unchanged PUT doesn't conflict with itself).
+`Settings` (pydantic-settings) validates `STORAGE_BACKEND` (`StorageBackend` enum, default `database`) and requires `DATABASE_URL` for the database backend. `lifespan` builds the matching services once and stores them on `app.state`. The in-memory backend keeps Assignment 1's seed Member and Book; the database backend starts empty.
 
-## Scope boundaries respected
+## Out of scope
 
-- No persistence yet — plain in-memory lists in `storage.py`, per the assignment's explicit scope boundary.
-- No automated tests — not introduced yet in the course; I tested manually with curl instead (see below).
-- Followed the same schema pattern as the reference project: `*Base` (shared fields + `model_config` with `extra="forbid"`, `str_strip_whitespace=True`, `frozen=True`), `*Input` (create/replace body), `*Response` (adds server-generated `id`).
-
-## Manual verification performed (all passed)
-
-Ran the app with `uv run uvicorn app.main:app --port 8123` and exercised with curl:
-- 200 on GET /members, /books, /members/{id}/books
-- 201 on valid POST /members and POST /books
-- 409 on duplicate email, duplicate membership_id, duplicate isbn
-- 422 on malformed phone, on published_year below 1450
-- 404 on POST /books with a nonexistent member_id, and on GET of a deleted member
-- 409 on DELETE /members/{id} when that member still has a book
-- 204 on DELETE /books/{id} and, after that, DELETE /members/{id} succeeds
+Tests, authentication, migrations (tables come from `create_all` at startup).

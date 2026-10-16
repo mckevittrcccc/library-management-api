@@ -1,38 +1,25 @@
 """HTTP endpoints for the Book resource."""
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Response, status
 
-from app.routers.members import find_member
+from app.dependencies import get_book_service
+from app.exceptions import (
+    BookIsbnAlreadyExistsError,
+    BookNotFoundError,
+    MemberNotFoundError,
+)
+from app.models.book import Book
+from app.routers.http_errors import (
+    book_isbn_already_exists,
+    book_not_found,
+    member_not_found,
+)
 from app.schemas.books import BookInput, BookResponse
-from app.storage import books
+from app.services.books import BookService
 
 # Every route in this file begins with /books and appears under the
 # Books heading in FastAPI's generated API documentation.
 router = APIRouter(prefix="/books", tags=["Books"])
-
-
-def find_book(book_id: int) -> BookResponse:
-    """Find one book or return an HTTP 404 error to the client."""
-    for book in books:
-        if book.id == book_id:
-            return book
-
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND,
-        detail="Book not found",
-    )
-
-
-def _check_unique_isbn(isbn: str, *, exclude_id: int | None = None) -> None:
-    """Reject an ISBN already used by a different Book."""
-    for book in books:
-        if exclude_id is not None and book.id == exclude_id:
-            continue
-        if book.isbn == isbn:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A book with this ISBN already exists",
-            )
 
 
 @router.get(
@@ -41,9 +28,9 @@ def _check_unique_isbn(isbn: str, *, exclude_id: int | None = None) -> None:
     summary="List all books",
     description="Return every book currently stored by the application.",
 )
-def list_books() -> list[BookResponse]:
-    """Return every book currently stored in memory."""
-    return books
+def list_books(service: BookService = Depends(get_book_service)) -> list[Book]:
+    """Delegate Book retrieval to the service layer."""
+    return service.list_books()
 
 
 @router.get(
@@ -53,9 +40,15 @@ def list_books() -> list[BookResponse]:
     description="Return the book identified by the path parameter.",
     responses={404: {"description": "Book not found"}},
 )
-def get_book(book_id: int) -> BookResponse:
-    """Return the book with the requested ID."""
-    return find_book(book_id)
+def get_book(
+    book_id: int,
+    service: BookService = Depends(get_book_service),
+) -> Book:
+    """Return one Book or translate the missing-resource error."""
+    try:
+        return service.get_book(book_id)
+    except BookNotFoundError:
+        raise book_not_found() from None
 
 
 # A Book can be created only when its related Member exists.
@@ -70,21 +63,17 @@ def get_book(book_id: int) -> BookResponse:
         409: {"description": "ISBN already in use"},
     },
 )
-def create_book(data: BookInput) -> BookResponse:
-    """Create a book associated with an existing member."""
-    # FastAPI validates BookInput before this function runs and uses the
-    # same schema in OpenAPI. This application-level check then confirms
-    # that the related Member resource actually exists.
-    find_member(data.member_id)
-    _check_unique_isbn(data.isbn)
-    next_book_id = max((book.id for book in books), default=0) + 1
-
-    book = BookResponse(
-        id=next_book_id,
-        **data.model_dump(),
-    )
-    books.append(book)
-    return book
+def create_book(
+    data: BookInput,
+    service: BookService = Depends(get_book_service),
+) -> Book:
+    """Create a Book after the service verifies its business rules."""
+    try:
+        return service.create_book(data)
+    except MemberNotFoundError:
+        raise member_not_found() from None
+    except BookIsbnAlreadyExistsError:
+        raise book_isbn_already_exists() from None
 
 
 # PUT replaces all editable Book values, including its Member relationship.
@@ -101,17 +90,17 @@ def create_book(data: BookInput) -> BookResponse:
 def replace_book(
     book_id: int,
     data: BookInput,
-) -> BookResponse:
-    """Replace an existing book after checking its related member."""
-    book = find_book(book_id)
-    find_member(data.member_id)
-    _check_unique_isbn(data.isbn, exclude_id=book_id)
-    updated_book = BookResponse(
-        id=book_id,
-        **data.model_dump(),
-    )
-    books[books.index(book)] = updated_book
-    return updated_book
+    service: BookService = Depends(get_book_service),
+) -> Book:
+    """Replace a Book after checking both related resources."""
+    try:
+        return service.replace_book(book_id, data)
+    except BookNotFoundError:
+        raise book_not_found() from None
+    except MemberNotFoundError:
+        raise member_not_found() from None
+    except BookIsbnAlreadyExistsError:
+        raise book_isbn_already_exists() from None
 
 
 @router.delete(
@@ -121,8 +110,13 @@ def replace_book(
     description="Delete the book identified by the path parameter.",
     responses={404: {"description": "Book not found"}},
 )
-def delete_book(book_id: int) -> Response:
-    """Remove a book from the in-memory collection."""
-    book = find_book(book_id)
-    books.remove(book)
+def delete_book(
+    book_id: int,
+    service: BookService = Depends(get_book_service),
+) -> Response:
+    """Delete a Book and translate the service outcome into HTTP."""
+    try:
+        service.delete_book(book_id)
+    except BookNotFoundError:
+        raise book_not_found() from None
     return Response(status_code=status.HTTP_204_NO_CONTENT)

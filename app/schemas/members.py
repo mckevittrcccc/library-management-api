@@ -64,6 +64,10 @@ class MemberInput(MemberBase):
 class MemberResponse(MemberBase):
     """Describe a Member returned by the API."""
 
+    # Pydantic can read values from SQLAlchemy model attributes, not only from
+    # dictionaries. FastAPI uses this when it converts ORM objects to JSON.
+    model_config = ConfigDict(from_attributes=True)
+
     # The server generates the ID, so it appears in responses but not in
     # MemberInput request bodies.
     id: int = Field(
